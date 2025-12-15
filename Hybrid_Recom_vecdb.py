@@ -5,59 +5,31 @@ import time
 import random
 import shutil
 from collections import defaultdict, Counter
-
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-DATA_PATH = "amazon-meta.txt.gz"   # can also be "amazon-meta.txt"
+DATA_PATH = "amazon-meta.txt.gz"   
 PERSIST_DIR = "chroma_store"
 COLLECTION_NAME = "amazon_products_100k"
-
 RANDOM_SEED = 42
 SAMPLE_SIZE = 100_000
-
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L12-v2"  # 384-d
-EMBED_BATCH = 64                  # CPU batch size for embedding
-UPSERT_BATCH = 2000               # avoid chroma max batch errors
-
-# Candidate sizes (tune if needed)
-CONTENT_TOP_N = 60                # used in interactive recommend + hybrid
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L12-v2" 
+EMBED_BATCH = 64                 
+UPSERT_BATCH = 2000               
+CONTENT_TOP_N = 60                
 CF_TOP_N = 60
-
-ALPHA = 0.6                       # hybrid knob (0..1)
-
-# Evaluation
+ALPHA = 0.6                       
 KS = (10, 20, 30, 40, 50)
-NUM_QUERIES = 50                  # query batch size for eval
-
-# IMPORTANT: always rebuild so embeddings are re-created every run
-ALWAYS_FRESH_RUN = True           # deletes persist dir + recreates collection each run
-
-
-# ============================================================
-# FILE OPEN (TXT OR GZ)
-# ============================================================
-
+NUM_QUERIES = 50                  
+ALWAYS_FRESH_RUN = True
 def open_text_file(path: str):
     if path.endswith(".gz"):
         return gzip.open(path, "rt", encoding="latin-1", errors="ignore")
     return open(path, "rt", encoding="latin-1", errors="ignore")
-
-
-# ============================================================
-# PARSER (amazon-meta format)
-# ============================================================
-
 def parse_amazon_meta(path: str):
     """
     Stream-parse amazon-meta file.
@@ -80,13 +52,10 @@ def parse_amazon_meta(path: str):
                 "similar": similar[:],
             }
         return None
-
     with open_text_file(path) as f:
         it = iter(f)
         for raw in it:
             line = raw.strip()
-
-            # New product boundary
             if line.startswith("Id:"):
                 rec = emit()
                 if rec:
@@ -127,17 +96,9 @@ def parse_amazon_meta(path: str):
                 if len(parts) >= 3:
                     similar = parts[2:]
                 continue
-
-        # last record
         rec = emit()
         if rec:
             yield rec
-
-
-# ============================================================
-# RESERVOIR SAMPLING (random 100k)
-# ============================================================
-
 def build_random_sample(path: str, sample_size: int, seed: int):
     """
     Reservoir sampling to uniformly sample from a large stream
@@ -160,12 +121,6 @@ def build_random_sample(path: str, sample_size: int, seed: int):
                 sample[j - 1] = rec
 
     return sample
-
-
-# ============================================================
-# TEXT FOR EMBEDDING
-# ============================================================
-
 def product_text(rec):
     # Keep concise; include 1 category path if present
     cat = rec["categories"][0] if rec["categories"] else ""
@@ -175,12 +130,6 @@ def product_text(rec):
     if cat:
         parts.append(f"Category: {cat}")
     return " | ".join(parts)
-
-
-# ============================================================
-# CO-PURCHASE GRAPH (within sampled ASINs only)
-# ============================================================
-
 def build_copurchase_graph(sample):
     asin_set = set(r["asin"] for r in sample)
     graph = defaultdict(Counter)  # graph[a][b] = weight
@@ -190,12 +139,6 @@ def build_copurchase_graph(sample):
             if b in asin_set and b != a:
                 graph[a][b] += 1
     return graph
-
-
-# ============================================================
-# CHROMA HELPERS
-# ============================================================
-
 def get_chroma_client(persist_dir: str):
     os.makedirs(persist_dir, exist_ok=True)
     return chromadb.PersistentClient(
@@ -211,7 +154,7 @@ def recreate_collection(client, name: str):
         pass
     return client.create_collection(
         name=name,
-        metadata={"hnsw:space": "cosine"}  # cosine distance
+        metadata={"hnsw:space": "cosine"} 
     )
 
 
@@ -225,11 +168,6 @@ def upsert_in_batches(collection, ids, docs, metadatas, embeddings, batch_size=2
             metadatas=metadatas[s:e],
             embeddings=embeddings[s:e]
         )
-
-
-# ============================================================
-# CONTENT CANDIDATES (Chroma query)
-# ============================================================
 
 def content_candidates(collection, query_embedding, top_n=50):
     res = collection.query(
@@ -248,11 +186,6 @@ def content_candidates(collection, query_embedding, top_n=50):
         out.append((asin, score, title))
     return out
 
-
-# ============================================================
-# CF CANDIDATES (co-purchase)
-# ============================================================
-
 def cf_candidates(cograph, asin, top_n=50):
     if asin not in cograph or not cograph[asin]:
         return []
@@ -263,12 +196,6 @@ def cf_candidates(cograph, asin, top_n=50):
         score = (w / max_w) if max_w > 0 else 0.0
         out.append((b, score))
     return out
-
-
-# ============================================================
-# HYBRID RECOMMENDATION (interactive)
-# ============================================================
-
 def resolve_query_to_asin(query, asin_to_title, title_to_asin):
     q = query.strip()
     if q in asin_to_title:
@@ -286,16 +213,11 @@ def resolve_query_to_asin(query, asin_to_title, title_to_asin):
 def recommend_hybrid(collection, model, cograph, asin_to_title, title_to_asin,
                      query, k=10, alpha=0.6, content_top_n=60, cf_top_n=60):
     q_asin, q_title = resolve_query_to_asin(query, asin_to_title, title_to_asin)
-
-    # Query embedding generated fresh per user query
     q_emb = model.encode([q_title], batch_size=1, show_progress_bar=False, convert_to_numpy=True)[0].tolist()
-
     cont = content_candidates(collection, q_emb, top_n=content_top_n)
     cont_scores = {a: s for a, s, _ in cont if a != q_asin}
-
     cf = cf_candidates(cograph, q_asin, top_n=cf_top_n)
     cf_scores = {a: s for a, s in cf if a != q_asin}
-
     union = set(cont_scores.keys()) | set(cf_scores.keys())
     scored = []
     for a in union:
@@ -305,64 +227,35 @@ def recommend_hybrid(collection, model, cograph, asin_to_title, title_to_asin,
         fs = cf_scores.get(a, 0.0)
         final = alpha * cs + (1 - alpha) * fs
         scored.append((a, final, cs, fs, asin_to_title[a]))
-
     scored.sort(key=lambda x: x[1], reverse=True)
     return (q_asin, q_title), scored[:k]
-
-
-# ============================================================
-# EVALUATION (Hybrid vs Content only)
-# Precision@K for multiple K and total batch runtime
-#
-# IMPORTANT CHANGE:
-# - Hybrid timing now INCLUDES its own Chroma content query time
-#   (no reusing 'cont' results from Content block).
-# ============================================================
-
 def precision_at_k(rec_asins, gt_set, k):
     if k <= 0:
         return 0.0
     topk = rec_asins[:k]
     return len(set(topk) & gt_set) / float(k)
-
-
 def evaluate_hybrid_vs_content(collection, model, asin_list, asin_to_title, cograph,
                                alpha=0.6, ks=(10, 20, 30, 40, 50), num_queries=50):
     rng = random.Random(RANDOM_SEED)
-
     eligible = [a for a in asin_list if a in cograph and len(cograph[a]) > 0 and a in asin_to_title]
     if not eligible:
         raise ValueError("No eligible query items found (need co-purchase neighbors).")
-
     if len(eligible) < num_queries:
         num_queries = len(eligible)
-
     queries = rng.sample(eligible, num_queries)
     maxK = max(ks)
-
     prec_content = {k: [] for k in ks}
     prec_hybrid = {k: [] for k in ks}
-
     total_time_content = 0.0
     total_time_hybrid = 0.0
-
     for q_asin in tqdm(queries, desc="Evaluating (Content vs Hybrid)"):
         q_title = asin_to_title[q_asin]
         q_emb = model.encode([q_title], batch_size=1, show_progress_bar=False, convert_to_numpy=True)[0].tolist()
         gt = set(cograph[q_asin].keys())
-
-        # -------------------------
-        # Content-only (includes Chroma query)
-        # -------------------------
         t0 = time.time()
         cont = content_candidates(collection, q_emb, top_n=maxK)
         cont_asins = [a for a, _, _ in cont if a != q_asin and a in asin_to_title]
         t1 = time.time()
-        total_time_content += (t1 - t0)
-
-        # -------------------------
-        # Hybrid (includes its OWN Chroma query + CF + fusion)
-        # -------------------------
         t0 = time.time()
         cont2 = content_candidates(collection, q_emb, top_n=maxK)  # do NOT reuse cont
         cont_scores = {a: s for a, s, _ in cont2 if a != q_asin}
@@ -435,12 +328,6 @@ def print_results(results, ks):
     print(f"Queries: {results['num_queries']}")
     print(f"Content total time: {results['total_time_content']:.4f} s")
     print(f"Hybrid  total time: {results['total_time_hybrid']:.4f} s")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -494,10 +381,6 @@ def main():
     print("\n7) Upserting embeddings into ChromaDB (batched)...")
     upsert_in_batches(collection, ids, docs, metas, emb, batch_size=UPSERT_BATCH)
     print(" ChromaDB populated (fresh run).")
-
-    # --------------------------------------------------------
-    # INTERACTIVE RECOMMENDATION
-    # --------------------------------------------------------
     while True:
         q = input("\nEnter ASIN or part of product title (or 'eval' / 'exit'): ").strip()
         if q.lower() == "exit":
@@ -525,10 +408,6 @@ def main():
                 print(f"{i:2d}. {a} | final={final:.3f} (content={cs:.3f}, cf={fs:.3f}) | {title}")
         except Exception as e:
             print("Error:", e)
-
-    # --------------------------------------------------------
-    # EVALUATION + PLOTS (Hybrid vs Content)
-    # --------------------------------------------------------
     print("\n=== Running evaluation: Precision@K (multi-K) + Total time ===")
     results = evaluate_hybrid_vs_content(
         collection=collection,
@@ -549,3 +428,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
